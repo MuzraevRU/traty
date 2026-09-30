@@ -111,6 +111,22 @@ body{padding-top:max(16px,env(safe-area-inset-top))}
 <h2>Записи за месяц</h2>
 <div class="list" id="list"></div>
 
+<h2>Синхронизация</h2>
+<div class="entry">
+  <div id="syncStatus" style="font-size:14px;margin-bottom:10px"></div>
+  <div id="syncForm">
+    <div class="row"><input id="ghOwner" placeholder="Логин GitHub" autocapitalize="off" autocorrect="off"></div>
+    <div class="row"><input id="ghRepo" value="traty-data" placeholder="Приватный репозиторий" autocapitalize="off" autocorrect="off"></div>
+    <div class="row"><input id="ghToken" type="password" placeholder="Токен github_pat_…" autocapitalize="off" autocorrect="off"></div>
+    <button class="save" id="ghConnect">Подключить</button>
+  </div>
+  <div id="syncOn" hidden>
+    <div id="syncWho" style="margin-bottom:10px"></div>
+    <button class="save" id="ghNow">Синхронизировать сейчас</button>
+    <button class="link" id="ghOff">Отключить на этом устройстве</button>
+  </div>
+</div>
+
 <h2>Резервная копия</h2>
 <div class="backup">
   <button class="link" id="exp">Сохранить копию в файл</button>
@@ -124,7 +140,7 @@ const DEFAULT_LIMITS = {
   "Аптеки":2000, "Развлечения и игры":4000, "Дом, одежда, прочее":3000,
   "Переводы людям":8000, "Учёба":2000
 };
-let state = { entries: [], limits: {...DEFAULT_LIMITS} };
+let state = { entries: [], deleted: [], limits: {...DEFAULT_LIMITS}, limitsAt: 0 };
 let view = new Date(); view.setDate(1);
 let picked = null;
 
@@ -134,17 +150,92 @@ const ym = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
 const today = () => { const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
 const color = p => p > 1 ? 'var(--over)' : p > .8 ? 'var(--warn)' : 'var(--ok)';
 
+function fromObj(o){ return { entries:o.entries||[], deleted:o.deleted||[], limits:{...DEFAULT_LIMITS, ...(o.limits||{})}, limitsAt:o.limitsAt||0 }; }
 function load(){
-  try{
-    const raw = localStorage.getItem('traty-data');
-    if (raw){ const s = JSON.parse(raw); state.entries = s.entries||[]; state.limits = {...DEFAULT_LIMITS, ...(s.limits||{})}; }
-  }catch(e){ $('msg').textContent = 'Не удалось прочитать данные. Восстановите их из резервной копии.'; }
+  try{ const raw = localStorage.getItem('traty-data'); if (raw) state = fromObj(JSON.parse(raw)); }
+  catch(e){ $('msg').textContent = 'Не удалось прочитать данные. Восстановите их из резервной копии.'; }
   render();
 }
-async function persist(){
+function saveLocal(){
   try{ localStorage.setItem('traty-data', JSON.stringify(state)); return true; }
   catch(e){ $('msg').textContent = 'Не удалось сохранить: в браузере закончилось место или запрещено хранение.'; return false; }
 }
+async function persist(){ const ok = saveLocal(); if(ok) scheduleSync(); return ok; }
+
+/* ---------- Синхронизация через приватный репозиторий GitHub ---------- */
+let sync = null;
+try{ sync = JSON.parse(localStorage.getItem('traty-sync')||'null'); }catch(e){}
+let syncing=false, again=false, timer=null;
+const b64e = str => { const by=new TextEncoder().encode(str); let bin=''; for(const x of by) bin+=String.fromCharCode(x); return btoa(bin); };
+const b64d = str => new TextDecoder().decode(Uint8Array.from(atob(str.replace(/\s/g,'')), c=>c.charCodeAt(0)));
+function canon(o){
+  return JSON.stringify({ entries:[...o.entries].sort((x,y)=>x.id-y.id), deleted:[...new Set(o.deleted)].sort((x,y)=>x-y), limits:o.limits, limitsAt:o.limitsAt });
+}
+function merge(a,b){
+  const del = new Set([...(a.deleted||[]),...(b.deleted||[])]);
+  const map = new Map();
+  [...(b.entries||[]),...(a.entries||[])].forEach(e=>{ if(!del.has(e.id)) map.set(e.id,e); });
+  const newer = (a.limitsAt||0) >= (b.limitsAt||0) ? a : b;
+  return fromObj({ entries:[...map.values()], deleted:[...del], limits:newer.limits, limitsAt:newer.limitsAt });
+}
+function setStatus(t, bad){ const el=$('syncStatus'); el.textContent=t; el.style.color = bad ? 'var(--over)' : 'var(--muted)'; }
+function gh(path, method='GET', body){
+  return fetch('https://api.github.com/repos/' + sync.owner + '/' + sync.repo + path, {
+    method, cache:'no-store',
+    headers:{ 'Authorization':'Bearer '+sync.token, 'Accept':'application/vnd.github+json', ...(body?{'Content-Type':'application/json'}:{}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+}
+function explain(e){
+  if(e==401) return 'Токен неверный или истёк. Создайте новый и подключитесь заново.';
+  if(e==403) return 'У токена нет прав на запись (нужно Contents: Read and write).';
+  if(e==404) return 'Репозиторий не найден или токен к нему не допущен.';
+  return 'Нет связи с GitHub. Записи сохранены на телефоне, синхронизирую позже.';
+}
+function scheduleSync(){ if(!sync) return; clearTimeout(timer); timer=setTimeout(doSync, 800); }
+async function doSync(){
+  if(!sync) return;
+  if(syncing){ again=true; return; }
+  syncing=true; setStatus('Синхронизация…');
+  try{
+    for(let i=0;i<3;i++){
+      const r = await gh('/contents/data.json');
+      let remote = fromObj({}), sha;
+      if(r.status===200){ const j=await r.json(); sha=j.sha; remote=fromObj(JSON.parse(b64d(j.content))); }
+      else if(r.status!==404) throw r.status;
+      state = merge(state, remote); saveLocal(); render();
+      const out = canon(state);
+      if(sha && out===canon(remote)) break;
+      const p = await gh('/contents/data.json','PUT',{ message:'sync ' + new Date().toISOString(), content:b64e(out), ...(sha?{sha}:{}) });
+      if(p.ok) break;
+      if(p.status===409 || p.status===422) continue;   // кто-то записал одновременно — повторяем
+      throw p.status;
+    }
+    setStatus('Синхронизировано в ' + new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}));
+  }catch(e){ setStatus(explain(e), true); }
+  finally{ syncing=false; if(again){ again=false; doSync(); } }
+}
+async function connect(){
+  const owner=$('ghOwner').value.trim(), repo=$('ghRepo').value.trim(), token=$('ghToken').value.trim();
+  if(!owner||!repo||!token){ setStatus('Заполните все три поля.', true); return; }
+  sync = {owner, repo, token}; setStatus('Проверяю доступ…');
+  try{
+    const r = await gh('');
+    if(!r.ok) throw r.status;
+    localStorage.setItem('traty-sync', JSON.stringify(sync));
+    $('ghToken').value=''; renderSync(); doSync();
+  }catch(e){ sync=null; setStatus(explain(e), true); }
+}
+function disconnect(){
+  if(!confirm('Отключить синхронизацию на этом устройстве? Записи на телефоне и в облаке останутся.')) return;
+  sync=null; localStorage.removeItem('traty-sync'); renderSync(); setStatus('Синхронизация выключена на этом устройстве.');
+}
+function renderSync(){
+  $('syncForm').hidden = !!sync; $('syncOn').hidden = !sync;
+  if(sync) $('syncWho').textContent = 'Подключено: ' + sync.owner + '/' + sync.repo;
+  else setStatus('Не подключено — записи хранятся только на этом устройстве.');
+}
+
 function exportData(){
   const blob = new Blob([JSON.stringify(state,null,1)],{type:'application/json'});
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
@@ -157,8 +248,8 @@ function importData(file){
     try{
       const s = JSON.parse(r.result);
       if(!Array.isArray(s.entries)) throw 0;
-      if(!confirm('Заменить текущие записи данными из копии (' + s.entries.length + ' записей)?')) return;
-      state.entries = s.entries; state.limits = {...DEFAULT_LIMITS, ...(s.limits||{})};
+      if(!confirm('Добавить записи из копии (' + s.entries.length + ' шт.)? Совпадающие не задвоятся.')) return;
+      state = merge(state, s);
       persist(); render(); $('msg').textContent = 'Данные восстановлены из копии.';
     }catch(e){ $('msg').textContent = 'Этот файл не похож на резервную копию трат.'; }
   };
@@ -206,7 +297,7 @@ function render(){
   $('limits').innerHTML = Object.keys(state.limits).map(c=>`
     <label class="lim"><span>${c}</span><input type="number" inputmode="numeric" value="${state.limits[c]}" data-c="${c}"></label>`).join('');
   document.querySelectorAll('#limits input').forEach(i=>i.onchange=async()=>{
-    state.limits[i.dataset.c] = Math.max(0, parseFloat(i.value)||0); await persist(); render();
+    state.limits[i.dataset.c] = Math.max(0, parseFloat(i.value)||0); state.limitsAt = Date.now(); await persist(); render();
   });
 }
 function esc(s){ return s.replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch])); }
@@ -214,7 +305,7 @@ function esc(s){ return s.replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&g
 async function del(id){
   const e = state.entries.find(x=>x.id===id);
   if(!e || !confirm('Удалить запись на ' + rub(e.amount) + '?')) return;
-  state.entries = state.entries.filter(x=>x.id!==id); await persist(); render();
+  state.entries = state.entries.filter(x=>x.id!==id); state.deleted.push(id); await persist(); render();
 }
 
 $('amt').oninput = check;
@@ -237,7 +328,12 @@ $('limBtn').onclick=()=>{ const o=$('limits').classList.toggle('open'); $('limBt
 $('exp').onclick = exportData;
 $('imp').onchange = e => { if(e.target.files[0]) importData(e.target.files[0]); e.target.value=''; };
 if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
-renderChips(); check(); load();
+$('ghConnect').onclick = connect;
+$('ghNow').onclick = doSync;
+$('ghOff').onclick = disconnect;
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') doSync(); });
+window.addEventListener('online', doSync);
+renderChips(); check(); load(); renderSync(); doSync();
 </script>
 </body>
 </html>
