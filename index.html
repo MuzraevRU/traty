@@ -95,6 +95,14 @@ h2{font-size:17px;font-weight:650;margin:22px 4px 10px}
 .donut svg{width:min(260px,72vw);height:auto;display:block;overflow:visible}
 .donut circle.seg{cursor:pointer;transition:stroke-width .2s,opacity .2s}
 .donut text{font-family:inherit;fill:var(--ink);pointer-events:none}
+.clist{margin-top:10px;border-top:1px solid var(--line)}
+.chead{font-size:13px;color:var(--muted);padding:8px 0 2px}
+.citem{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.citem:last-child{border-bottom:0}
+.citem .cn{font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.citem .d{font-size:13px;color:var(--muted)}
+.citem .sum{font-weight:600;white-space:nowrap}
+.citem>div{min-width:0}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:1px}
 .cat.sel{box-shadow:inset 0 0 0 2px var(--accent)}
 .cat.click{cursor:pointer}
@@ -291,8 +299,9 @@ function renderMonth(){
   $('cats').innerHTML = outCats.map(c=>{
     const s=by[c]||0, l=state.limits[c]||0, q=l ? s/l : (s?2:0);
     return `<div class="cat ${s?'click':''} ${slice===c?'sel':''}" data-slice="${s?esc(c):''}"><div class="top"><b><span class="dot" style="background:${colorOf(c)}"></span>${esc(c)}</b><span>${rub(s)} <small>/ ${rub(l)}</small></span></div>
-      <div class="bar"><i style="width:${Math.min(q,1)*100}%;background:${color(q)}"></i></div></div>`;
+      <div class="bar"><i style="width:${Math.min(q,1)*100}%;background:${color(q)}"></i></div>${slice===c ? catList(outs, c) : ''}</div>`;
   }).join('');
+  $('cats').querySelectorAll('.citem').forEach(el=>el.onclick=ev=>{ ev.stopPropagation(); startEdit(+el.dataset.id); });
   $('cats').querySelectorAll('[data-slice]').forEach(el=>{ if(el.dataset.slice) el.onclick=()=>{ slice = slice===el.dataset.slice ? null : el.dataset.slice; renderMonth(); }; });
 
   const bi = {}; ins.forEach(e=>bi[e.cat]=(bi[e.cat]||0)+e.amount);
@@ -313,6 +322,14 @@ function renderMonth(){
   $('list').querySelectorAll('[data-del]').forEach(el=>el.onclick=()=>del(+el.dataset.del));
 }
 
+
+function catList(outs, c){
+  const items = outs.filter(e=>e.cat===c).sort((a,b)=>b.date.localeCompare(a.date)||b.id-a.id);
+  return `<div class="clist"><div class="chead">${items.length} ${plural(items.length,'покупка','покупки','покупок')} за месяц · нажмите, чтобы изменить</div>` +
+    items.map(e=>`<div class="citem" data-id="${e.id}"><div><div class="cn">${esc(e.note || 'Без описания')}</div>
+      <div class="d">${e.date.slice(8,10)}.${e.date.slice(5,7)} · ${esc(e.card)}</div></div><span class="sum">${rub(e.amount)}</span></div>`).join('') + '</div>';
+}
+function plural(n,a,b,c){ const m=n%10, h=n%100; return m===1&&h!==11 ? a : m>=2&&m<=4&&(h<12||h>14) ? b : c; }
 
 function renderDonut(by, spent, outCats, colorOf){
   const R = 15.915, W = slice ? 5 : 6;
@@ -339,7 +356,7 @@ function renderDonut(by, spent, outCats, colorOf){
   $('donut').innerHTML = `<svg viewBox="0 0 42 42" role="img" aria-label="Расходы по категориям за месяц">
     <circle cx="21" cy="21" r="${R}" fill="none" stroke="var(--bg)" stroke-width="6"></circle>${segs}
     <circle id="dCenter" cx="21" cy="21" r="12" fill="transparent"></circle>${center}</svg>`;
-  $('donut').querySelectorAll('circle.seg').forEach(el=>el.onclick=()=>{ slice = slice===el.dataset.c ? null : el.dataset.c; renderMonth(); });
+  $('donut').querySelectorAll('circle.seg').forEach(el=>el.onclick=()=>{ slice = slice===el.dataset.c ? null : el.dataset.c; renderMonth(); const sel=document.querySelector('.cat.sel'); if(sel) sel.scrollIntoView({behavior:'smooth',block:'nearest'}); });
   $('dCenter').onclick=()=>{ if(slice){ slice=null; renderMonth(); } };
 }
 
